@@ -1,0 +1,121 @@
+---
+- name: Ejecutar pruebas de Playwright sobre página local
+  hosts: local
+  become: yes
+  gather_facts: yes
+  vars:
+    repo_dest: "{{ playbook_dir }}/.."
+    node_version: "18"
+    html_port: 8080
+
+  tasks:
+    - name: Actualizar cache de apt
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Validar e instalar dependencias del sistema
+      ansible.builtin.apt:
+        name:
+          - curl
+          - unzip
+        state: present
+
+    - name: Verificar si Node.js ya está instalado
+      ansible.builtin.command: node --version
+      register: node_check
+      ignore_errors: yes
+      changed_when: no
+
+    - name: Instalar Node.js {{ node_version }} si no está presente
+      ansible.builtin.shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+        apt-get install -y nodejs
+      when: node_check is failed
+
+    - name: Verificar si node_modules existe
+      ansible.builtin.stat:
+        path: "{{ repo_dest }}/node_modules"
+      register: nm_check
+
+    - name: Instalar dependencias npm si no existen
+      ansible.builtin.command:
+        cmd: npm install
+        chdir: "{{ repo_dest }}"
+      when: not nm_check.stat.exists
+
+    - name: Verificar si Playwright browsers están instalados
+      ansible.builtin.stat:
+        path: "{{ repo_dest }}/node_modules/.cache/ms-playwright"
+      register: pw_cache_check
+
+    - name: Instalar dependencias del sistema para Chromium
+      ansible.builtin.command:
+        cmd: npx playwright install-deps chromium
+        chdir: "{{ repo_dest }}"
+
+    - name: Instalar navegadores de Playwright si no existen
+      ansible.builtin.command:
+        cmd: npx playwright install chromium
+        chdir: "{{ repo_dest }}"
+      when: not pw_cache_check.stat.exists
+
+    - name: Verificar si http-server está disponible
+      ansible.builtin.command: which http-server
+      register: hs_check
+      ignore_errors: yes
+      changed_when: no
+
+    - name: Instalar http-server globalmente si no está presente
+      ansible.builtin.command:
+        cmd: npm install -g http-server
+      when: hs_check is failed
+
+    - name: Iniciar servidor HTTP para la página local
+      ansible.builtin.shell: |
+        nohup http-server public -p {{ html_port }} --silent > /tmp/httpserver.log 2>&1 &
+      args:
+        chdir: "{{ repo_dest }}"
+
+    - name: Esperar a que el servidor esté listo
+      ansible.builtin.uri:
+        url: "http://localhost:{{ html_port }}"
+        status_code: 200
+      register: server_check
+      until: server_check.status == 200
+      retries: 10
+      delay: 2
+
+    - name: Ejecutar tests de Playwright
+      ansible.builtin.command:
+        cmd: npx playwright test --project=chromium --reporter=list
+        chdir: "{{ repo_dest }}"
+      environment:
+        BASE_URL: "http://localhost:{{ html_port }}"
+      register: test_result
+      ignore_errors: yes
+
+    - name: Detener servidor HTTP
+      ansible.builtin.shell: |
+        kill $(lsof -t -i:{{ html_port }} 2>/dev/null) 2>/dev/null || true
+      changed_when: no
+      ignore_errors: yes
+
+    - name: Publicar reporte HTML de Playwright
+      ansible.builtin.fetch:
+        src: "{{ repo_dest }}/playwright-report/index.html"
+        dest: ./reports/playwright-report.html
+        flat: yes
+      when: test_result.rc is defined and test_result.rc == 0
+
+    - name: Mostrar resumen final de la ejecucion
+      ansible.builtin.debug:
+        msg:
+          - "======================================== RESUMEN ========================================"
+          - "Node.js   : {{ 'OK' if node_check is not failed else 'Instalado durante la ejecucion' }}"
+          - "npm deps  : {{ 'Ya existian' if nm_check.stat.exists else 'Instaladas' }}"
+          - "Browsers  : {{ 'Ya instalados' if pw_cache_check.stat.exists else 'Instalados' }}"
+          - "http-srv  : {{ 'Ya presente' if hs_check is not failed else 'Instalado' }}"
+          - "Servidor  : http://localhost:{{ html_port }} ({{ 'OK' if server_check.status == 200 else 'Fallo' }})"
+          - "Tests     : {{ 'PASARON' if test_result.rc is defined and test_result.rc == 0 else 'FALLARON/TIMEOUT' }} (exit code {{ test_result.rc | default('N/A') }})"
+          - "========================================================================================"
